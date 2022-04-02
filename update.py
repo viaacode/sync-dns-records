@@ -10,24 +10,23 @@ import traceback
 import datetime
 import threading
 import logging
-
+import configparser;
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] (%(threadName)s): %(message)s')
 
-IBMDnsServers = [ '162.159.42.2', '162.159.34.3', '10.50.24.30', '10.50.24.31' ]
+config = configparser.ConfigParser()
+config.read('update.ini')
+RemoteDnsServers = config['DEFAULT']['RemoteDnsServers'].split(',')
+print(RemoteDnsServers)
+loadbalancers = {}
+for domain in [ dm for dm in config.keys() if re.search('\w\.\w', dm) ]:
+  zone = config[domain]['zone']
+  lb = config[domain]['loadbalancer']
+  if not loadbalancers.get(lb): loadbalancers[lb] = []
+  loadbalancers[lb].append({'fqdn': domain, 'zone': zone})
+print(loadbalancers)
 
-domains = [
-        {
-            'fqdn': 'onderwijs.hetarchief.be',
-            'zone': 'hetarchief.be',
-            'lbhostname': '8c77acda-eu-de.lb.appdomain.cloud'
-        }#,
-#        {
-#            'fqdn': 'hetarchief.be',
-#            'zone': 'hetarchief.be',
-#            'lbhostname': '8c77acda-eu-de.lb.appdomain.cloud'
-#            }
-        ]
+
 # Bind generates a local TSIG key in /var/run/named/session.key if any local
 # primary zone has set update-policy to local. We extract the TSIG key form this file
 # just before and every time we need it.
@@ -66,7 +65,7 @@ def valid(response, name):
 def query_ibm(hostname):
     q_ibm = dns.message.make_query(hostname, 'A')
     response = None
-    for server in IBMDnsServers:
+    for server in RemoteDnsServers:
         try:
             logging.debug(f'query {server}')
             r_ibm = dns.query.udp(q_ibm, server, timeout=5)
@@ -78,6 +77,11 @@ def query_ibm(hostname):
             time.sleep(5)
     return response
 
+class TstDns:
+
+    def rcode(self):
+        return dns.rcode.NOTIMP
+
 loacl_dns_lock = threading.Lock()
 def update_local_dns(zone, name, rdataset):
     update = dns.update.UpdateMessage(f'{zone}.', keyring=get_keyring())
@@ -87,21 +91,22 @@ def update_local_dns(zone, name, rdataset):
     return resp.rcode()
 
 
-def track(domain):
+def track(lb, domains):
   while True:
-    ibm_a_records = query_ibm(domain['lbhostname'])
+    ibm_a_records = query_ibm(lb)
     if ibm_a_records:
-      q_meemoo = dns.message.make_query(f'{domain["fqdn"]}.', 'A')
-      try:
-        r_meemoo = dns.query.udp(q_meemoo, '127.0.0.1', timeout=3)
-        if not r_meemoo.answer or (r_meemoo.answer[0].to_rdataset() != ibm_a_records):
-            logging.info(f'Replacing: {r_meemoo.answer}')
-            result = update_local_dns(domain["zone"], domain["fqdn"], ibm_a_records)
-            logging.debug(dns.rcode.to_text(result))
-        else:
-            logging.info(f'equal: {r_meemoo.answer}')
-      except:
-          traceback.print_exc()
+      for domain in domains:
+        q_local = dns.message.make_query(f'{domain["fqdn"]}.', 'A')
+        try:
+          r_local = dns.query.udp(q_local, '127.0.0.1', timeout=3)
+          if not r_local.answer or (r_local.answer[0].to_rdataset() != ibm_a_records):
+              logging.info(f'Replacing: {r_local.answer} by {[ ibm_a_records]}')
+              result = update_local_dns(domain["zone"], domain["fqdn"], ibm_a_records)
+              logging.debug(f'Replacing <{domain["fqdn"]}>: {dns.rcode.to_text(result)}')
+          else:
+              logging.info(f'Equal: {r_local.answer}')
+        except:
+            traceback.print_exc()
       t = ibm_a_records.ttl + 1
     else:
       t = 30 
@@ -109,8 +114,8 @@ def track(domain):
     time.sleep(t) 
 
 threads = []
-for domain in domains:
-    threads.append(threading.Thread(target=track, args=(domain,), name = domain['fqdn']))
+for loadbalancer in loadbalancers.keys():
+    threads.append(threading.Thread(target=track, args=(loadbalancer, loadbalancers[loadbalancer]), name = loadbalancer))
 
 for thread in threads:
     logging.debug(f'Starting thread {thread.name}')
