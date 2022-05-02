@@ -4,12 +4,14 @@ import dns.query
 import dns.message
 import dns.tsigkeyring
 import dns.update
+import dns.resolver
 import time
 import re
 import traceback
 import threading
 import logging
 import configparser
+import http.server
 
 logging.basicConfig(level=logging.DEBUG,
         format='%(asctime)s [%(levelname)s] (%(threadName)s): %(message)s')
@@ -19,7 +21,27 @@ config.read('update.ini')
 RemoteDnsServers = config['DEFAULT']['RemoteDnsServers'].split(',')
 print(RemoteDnsServers)
 loadbalancers = {}
-domainnames = [dm for dm in config.keys() if re.search('[a-zA-Z0-9-]\.[a-zA-Z0-9-]', dm)]
+domainnames = [d for d in config if re.search('[a-zA-Z0-9-]\.[a-zA-Z0-9-]', d)]
+
+class Monitor(http.server.BaseHTTPRequestHandler):
+
+    resolver = dns.resolver.Resolver(configure=False)
+    resolver.nameservers = (['8.8.8.8', '8.8.4.4'])
+
+    def get_rds(self, host):
+        return self.resolver.resolve(host).rrset.to_rdataset()
+
+    def do_GET(self):
+        result = [self.get_rds(d) == self.get_rds(config[d]['loadbalancer']) for d in domainnames]
+        self.send_response(200 if all(result) else 404)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        for i,d in enumerate(domainnames):
+            if result[i]:
+                self.wfile.write((f'OK: {config[d].name}\n'.encode()))
+            else:
+                self.wfile.write(f'ERROR: {config[d].name}\n'.encode())
+
 for domain in domainnames:
     zone = config[domain]['zone']
     lb = config[domain]['loadbalancer']
@@ -31,10 +53,9 @@ print(loadbalancers)
 
 #
 # Bind generates a local TSIG key in /var/run/named/session.key if any local
-# primary zone has set update-policy to local. We extract the TSIG key form this file
-# just before and every time we need it.
-# This file is formatted as follows:
-#
+# primary zone has set update-policy to local. We extract the TSIG key from
+# this file
+# The file is formatted as follows:
 # key "local-ddns" {
 #	algorithm hmac-sha256;
 #	secret "base64 encoded secret";
@@ -97,18 +118,11 @@ def update_local_dns(zone, name, rdataset):
         resp = dns.query.udp(update, '127.0.0.1')
     return resp.rcode()
 
-def check_local_dns(domain, remote_a_records):
-    q_local = dns.message.make_query(f'{domain["fqdn"]}.', 'A')
-    try:
-        r_local = dns.query.udp(q_local, '127.0.0.1', timeout=3)
-        if not r_local.answer or (r_local.answer[0].to_rdataset() != remote_a_records):
-            logging.info(f'Replacing: {r_local.answer} by {[ remote_a_records]}')
-            result = update_local_dns(domain["zone"], domain["fqdn"], remote_a_records)
-            logging.debug(f'Replacing <{domain["fqdn"]}>: {dns.rcode.to_text(result)}')
-        else:
-            logging.info(f'Equal: {r_local.answer}')
-    except Exception:
-        traceback.print_exc()
+def local_dns_insync(fqdn, remote_a_records):
+    q_local = dns.message.make_query(f'{fqdn}.', 'A')
+    r_local = dns.query.udp(q_local, '127.0.0.1', timeout=3)
+    logging.info(f'Local response: {r_local.answer}')
+    return r_local.answer[0].to_rdataset() == remote_a_records if r_local.answer else false
 
 
 def track(lb, domains):
@@ -116,7 +130,15 @@ def track(lb, domains):
         remote_a_records = query_remote(lb)
         if remote_a_records:
             for domain in domains:
-                check_local_dns(domain, remote_a_records)
+              try:
+                if not local_dns_insync(domain['fqdn'], remote_a_records):
+                    logging.info(f'Replacing: local records by {[ remote_a_records]}')
+                    result = update_local_dns(domain["zone"], domain["fqdn"], remote_a_records)
+                    logging.debug(f'Replacing <{domain["fqdn"]}>: {dns.rcode.to_text(result)}')
+                else:
+                    logging.info(f'{domain["fqdn"]}: Equal!')
+              except Exception:
+                  traceback.print_exc()
             t = remote_a_records.ttl + 1
         else:
             t = 30
@@ -134,3 +156,5 @@ for thread in threads:
     logging.debug(f'Starting thread {thread.name}')
     thread.start()
 
+httpd = http.server.HTTPServer(('',8080), Monitor)
+httpd.serve_forever()
