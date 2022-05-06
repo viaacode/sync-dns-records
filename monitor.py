@@ -14,10 +14,10 @@ class Monitor(http.server.BaseHTTPRequestHandler):
     def get_rds(self, host):
         return self.resolver.resolve(host).rrset.to_rdataset()
 
-    #def do_POST(self):
-    #    do_GET(self)
-
     def do_POST(self):
+        self.do_GET()
+
+    def do_GET(self):
         content_len = int(self.headers.get('Content-Length')) if self.headers.get('Content-Length') else 0
         lbs = json.loads(self.rfile.read(content_len))
         result = []

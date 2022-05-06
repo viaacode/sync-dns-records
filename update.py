@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.DEBUG,
 
 config = configparser.ConfigParser()
 config.read('update.ini')
-RemoteDnsServers = config['DEFAULT']['RemoteDnsServers'].split(',')
+RemoteDnsServers = config['DEFAULT']['RemoteDnsServers'].split()
 print(RemoteDnsServers)
 loadbalancers = {}
 domainnames = [d for d in config if re.search('[a-zA-Z0-9-]\.[a-zA-Z0-9-]', d)]
@@ -41,16 +41,17 @@ print(loadbalancers)
 # };
 def get_keyring():
     with open('/var/run/named/session.key', 'r') as keyfile:
-         key_name = key_secret = ''
-         for line in keyfile:
-             match = re.search('^\s*key\s*"([^"]+)"\s*{', line)
-             if match:
-                 key_name = match.group(1)
-             match = re.search('secret\s*"([^"]*)"\s*;\s*', line)
-             if key_name and match:
-                 key_secret = match.group(1)
-                 break
-    if not key_secret: raise RuntimeError('Load tsig key')
+        key_name = key_secret = ''
+        for line in keyfile:
+            match = re.search('^\s*key\s*"([^"]+)"\s*{', line)
+            if match:
+                key_name = match.group(1)
+            match = re.search('secret\s*"([^"]*)"\s*;\s*', line)
+            if key_name and match:
+                key_secret = match.group(1)
+                break
+    if not key_secret:
+        raise RuntimeError('Load tsig key')
     return dns.tsigkeyring.from_text({key_name: key_secret})
 
 
@@ -84,10 +85,11 @@ def query_remote(hostname):
                 response = r_remote.answer[0].to_rdataset()
         except StopIteration:
             break
-        except:  # We reaaly want to catch all other exceptions here
+        except Exception:  # We reaaly want to catch all other exceptions here
             traceback.print_exc()
             time.sleep(5)
     return response
+
 
 def update_local_dns(zone, name, rdataset):
     update = dns.update.UpdateMessage(f'{zone}.', keyring=get_keyring())
@@ -96,11 +98,24 @@ def update_local_dns(zone, name, rdataset):
         resp = dns.query.udp(update, '127.0.0.1')
     return resp.rcode()
 
+
 def local_dns_insync(fqdn, remote_a_records):
     q_local = dns.message.make_query(f'{fqdn}.', 'A')
     r_local = dns.query.udp(q_local, '127.0.0.1', timeout=3)
     logging.info(f'Local response: {r_local.answer}')
-    return r_local.answer[0].to_rdataset() == remote_a_records if r_local.answer else false
+    return r_local.answer[0].to_rdataset() == remote_a_records if r_local.answer else False
+
+def track_domain(domain, remote_a_records):
+    try:
+        if not local_dns_insync(domain['fqdn'], remote_a_records):
+            logging.info(f'Replacing: local records by {[ remote_a_records]}')
+            result = update_local_dns(domain["zone"],
+                    domain["fqdn"], remote_a_records)
+            logging.debug(f'Replacing <{domain["fqdn"]}>: {dns.rcode.to_text(result)}')
+        else:
+            logging.info(f'{domain["fqdn"]}: Equal!')
+    except Exception:
+        traceback.print_exc()
 
 
 def track(lb, domains):
@@ -108,16 +123,8 @@ def track(lb, domains):
         remote_a_records = query_remote(lb)
         if remote_a_records:
             for domain in domains:
-              try:
-                if not local_dns_insync(domain['fqdn'], remote_a_records):
-                    logging.info(f'Replacing: local records by {[ remote_a_records]}')
-                    result = update_local_dns(domain["zone"], domain["fqdn"], remote_a_records)
-                    logging.debug(f'Replacing <{domain["fqdn"]}>: {dns.rcode.to_text(result)}')
-                else:
-                    logging.info(f'{domain["fqdn"]}: Equal!')
-              except Exception:
-                  traceback.print_exc()
-            t = remote_a_records.ttl + 1
+                track_domain(domain, remote_a_records)
+                t = remote_a_records.ttl + 1
         else:
             t = 30
         logging.debug(f'sleeping {t} seonds')
