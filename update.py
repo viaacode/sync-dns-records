@@ -9,27 +9,14 @@ import re
 import traceback
 import threading
 import logging
-import configparser
 import http.server
 from monitor import Monitor
+from config import Config
 
 logging.basicConfig(level=logging.DEBUG,
         format='%(asctime)s [%(levelname)s] (%(threadName)s): %(message)s')
 
-config = configparser.ConfigParser()
-config.read('update.ini')
-RemoteDnsServers = config['DEFAULT']['RemoteDnsServers'].split()
-print(RemoteDnsServers)
-loadbalancers = {}
-domainnames = [d for d in config if re.search('[a-zA-Z0-9-]\.[a-zA-Z0-9-]', d)]
-
-for domain in domainnames:
-    zone = config[domain]['zone']
-    lb = config[domain]['loadbalancer']
-    if not loadbalancers.get(lb):
-        loadbalancers[lb] = []
-    loadbalancers[lb].append({'fqdn': domain, 'zone': zone})
-print(loadbalancers)
+cfg = Config('update.ini')
 
 
 # Bind generates a local TSIG key in /var/run/named/session.key if any local
@@ -60,10 +47,10 @@ def valid(response, name):
     answer = response.answer
     if (answer and  # There is an answer section
             len(answer) == 1 and  # It contains exactly one rrset
-            answer[0].name.to_text() == f'{name}.' and  # It is an answer for name
-            len(answer[0]) >= 1 and  # We have at least one RR in our rrset
-            # We have nothing but A records
-            all([x.rdtype == dns.rdatatype.A for x in answer])):
+                answer[0].name.to_text() == f'{name}.' and  # It is an answer for name
+                len(answer[0]) >= 1 and  # We have at least one RR in our rrset
+                # We have nothing but A records
+                all([x.rdtype == dns.rdatatype.A for x in answer])):
         logging.debug(f'valid response: {answer}')
         return True
     else:
@@ -75,7 +62,7 @@ def valid(response, name):
 def query_remote(hostname):
     q_remote = dns.message.make_query(hostname, 'A')
     response = None
-    servers = iter(RemoteDnsServers)
+    servers = iter(cfg.remote_dns)
     while response is None:
         try:
             server = next(servers)
@@ -105,6 +92,7 @@ def local_dns_insync(fqdn, remote_a_records):
     logging.info(f'Local response: {r_local.answer}')
     return r_local.answer[0].to_rdataset() == remote_a_records if r_local.answer else False
 
+
 def track_domain(domain, remote_a_records):
     try:
         if not local_dns_insync(domain['fqdn'], remote_a_records):
@@ -133,13 +121,13 @@ def track(lb, domains):
 
 local_dns_lock = threading.Lock()
 threads = []
-for loadbalancer in loadbalancers.keys():
+for loadbalancer in cfg.loadbalancers.keys():
     threads.append(threading.Thread(target=track,
-        args=(loadbalancer, loadbalancers[loadbalancer]), name=loadbalancer))
+        args=(loadbalancer, cfg.loadbalancers[loadbalancer]), name=loadbalancer))
 
 for thread in threads:
     logging.debug(f'Starting thread {thread.name}')
     thread.start()
 
-httpd = http.server.HTTPServer(('',8080), Monitor)
+httpd = http.server.HTTPServer(('', 8080), Monitor)
 httpd.serve_forever()
