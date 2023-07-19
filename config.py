@@ -7,7 +7,6 @@ class Config:
         self.config = configparser.ConfigParser()
         self.config.read(filename)
         self.remote_dns = self.config['DEFAULT']['RemoteDnsServers'].split()
-        print(self.remote_dns)
         self.set_loadbalancers()
 
     def set_loadbalancers(self):
@@ -20,5 +19,4 @@ class Config:
                     loadbalancers[lb] = []
                 loadbalancers[lb].append({'fqdn': domain, 'zone': zone})
         self.loadbalancers = loadbalancers
-        print(loadbalancers)
 

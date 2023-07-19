@@ -1,0 +1,9 @@
+[DEFAULT]
+RemoteDnsServers: 162.159.42.2 162.159.34.3
+zone: example.net
+
+[app-prd.example.net]
+loadbalancer: lb-id1.lb.appdomain.cloud
+
+[app-tst.example.net]
+loadbalancer: lb-id2.lb.appdomain.cloud

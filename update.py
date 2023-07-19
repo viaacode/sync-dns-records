@@ -14,9 +14,14 @@ from monitor import Monitor
 from config import Config
 
 logging.basicConfig(level=logging.DEBUG,
-        format='%(asctime)s [%(levelname)s] (%(threadName)s): %(message)s')
+    format='%(asctime)s [%(levelname)s] (%(threadName)s): %(message)s')
 
+# Build a dictionary loadbalancers with the domains and zones to be
+# synchronised:
+# {'loadbalancer-fqdn': [ {'fqdn': 'app.domain.net', 'zone': 'domain.net'} ]
 cfg = Config('update.ini')
+logging.debug(f'Remote DNS servers: {cfg.remote_dns}')
+logging.debug(f'Loadbalancers: {cfg.loadbalancers}')
 
 
 # Bind generates a local TSIG key in /var/run/named/session.key if any local
@@ -42,14 +47,18 @@ def get_keyring():
     return dns.tsigkeyring.from_text({key_name: key_secret})
 
 
-# Check if we have a valid response
-def valid(response, name):
+# Do some sanity checks on a response.
+# - there must be an answer section
+# - The answer must contain exactly one rrset
+# - It must be an answer for the given name
+# - It must contain exactly one rr
+# - The rr must only contain A records
+def is_valid(response, name):
     answer = response.answer
-    if (answer and  # There is an answer section
-            len(answer) == 1 and  # It contains exactly one rrset
-                answer[0].name.to_text() == f'{name}.' and  # It is an answer for name
-                len(answer[0]) >= 1 and  # We have at least one RR in our rrset
-                # We have nothing but A records
+    if (answer and
+            len(answer) == 1 and
+                answer[0].name.to_text() == f'{name}.' and
+                len(answer[0]) >= 1 and
                 all([x.rdtype == dns.rdatatype.A for x in answer])):
         logging.debug(f'valid response: {answer}')
         return True
@@ -59,16 +68,17 @@ def valid(response, name):
         return False
 
 
-def query_remote(hostname):
+def query_remote_dns(hostname):
     q_remote = dns.message.make_query(hostname, 'A')
     response = None
     servers = iter(cfg.remote_dns)
+    # Loop over the remote DNS servers untill we have a valid response
     while response is None:
         try:
             server = next(servers)
             logging.debug(f'query {server}')
             r_remote = dns.query.udp(q_remote, server, timeout=5)
-            if valid(r_remote, hostname):
+            if is_valid(r_remote, hostname):
                 response = r_remote.answer[0].to_rdataset()
         except StopIteration:
             break
@@ -86,16 +96,16 @@ def update_local_dns(zone, name, rdataset):
     return resp.rcode()
 
 
-def local_dns_insync(fqdn, remote_a_records):
+def is_local_dns_insync(fqdn, remote_a_records):
     q_local = dns.message.make_query(f'{fqdn}.', 'A')
     r_local = dns.query.udp(q_local, '127.0.0.1', timeout=3)
     logging.info(f'Local response: {r_local.answer}')
     return r_local.answer[0].to_rdataset() == remote_a_records if r_local.answer else False
 
 
-def track_domain(domain, remote_a_records):
+def sync_domain(domain, remote_a_records):
     try:
-        if not local_dns_insync(domain['fqdn'], remote_a_records):
+        if not is_local_dns_insync(domain['fqdn'], remote_a_records):
             logging.info(f'Replacing: local records by {[ remote_a_records]}')
             result = update_local_dns(domain["zone"],
                     domain["fqdn"], remote_a_records)
@@ -106,12 +116,14 @@ def track_domain(domain, remote_a_records):
         traceback.print_exc()
 
 
+# Entrypoint for the thread that tracks a loadbalancer's domains
+# check interval is given by the remote DNS record TTL
 def track(lb, domains):
     while True:
-        remote_a_records = query_remote(lb)
+        remote_a_records = query_remote_dns(lb)
         if remote_a_records:
             for domain in domains:
-                track_domain(domain, remote_a_records)
+                sync_domain(domain, remote_a_records)
                 t = remote_a_records.ttl + 1
         else:
             t = 30
@@ -120,14 +132,15 @@ def track(lb, domains):
 
 
 local_dns_lock = threading.Lock()
-threads = []
-for loadbalancer in cfg.loadbalancers.keys():
-    threads.append(threading.Thread(target=track,
-        args=(loadbalancer, cfg.loadbalancers[loadbalancer]), name=loadbalancer))
+threads = [
+    threading.Thread(target=track, args=(lb, cfg.loadbalancers[lb]), name=lb)
+    for lb in cfg.loadbalancers.keys()
+    ]
 
 for thread in threads:
     logging.debug(f'Starting thread {thread.name}')
     thread.start()
 
+# Start http server for monitoring
 httpd = http.server.HTTPServer(('', 8080), Monitor)
 httpd.serve_forever()

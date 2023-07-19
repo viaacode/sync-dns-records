@@ -1,0 +1,16 @@
+[Unit]
+Description=meemoo DNS updater
+After=bind9.service
+
+[Service]
+User=bind
+Group=bind
+ExecStart=pipenv run ./update.py
+KillMode=process
+Restart=always
+RestartSec=5s
+Type=exec
+WorkingDirectory=/var/cache/bind/sync-dns-records
+
+[Install]
+WantedBy=multi-user.target
